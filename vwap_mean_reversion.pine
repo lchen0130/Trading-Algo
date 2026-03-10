@@ -1,0 +1,343 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Leo — VWAP Mean Reversion Strategy v1.0
+// Designed for intraday (1m–15m) multi-asset use with TradersPost webhook integration
+
+//@version=5
+strategy("VWAP Mean Reversion", 
+     overlay=true, 
+     initial_capital=100000, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_order, 
+     commission_value=0.0,
+     slippage=1,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     max_bars_back=5000)
+
+// ─────────────────────────────────────────────
+// 📌 INPUTS
+// ─────────────────────────────────────────────
+
+// -- VWAP Band Settings --
+grp_vwap = "VWAP Bands"
+vwapSource      = input.source(hlc3, "VWAP Source", group=grp_vwap)
+entryBandMult   = input.float(1.5, "Entry Band (σ multiplier)", minval=0.5, maxval=4.0, step=0.1, group=grp_vwap, tooltip="Outer band where entries trigger. 1.5–2.0 recommended.")
+innerBandMult   = input.float(1.0, "Inner Band (σ multiplier)", minval=0.25, maxval=3.0, step=0.1, group=grp_vwap, tooltip="First take-profit target band.")
+
+// -- Regime Filter --
+grp_regime = "Regime Filter"
+useADXFilter    = input.bool(true, "Enable ADX Filter", group=grp_regime)
+adxLen          = input.int(14, "ADX Length", minval=5, maxval=50, group=grp_regime)
+adxThreshold    = input.float(25.0, "ADX Threshold (below = range-bound)", minval=10.0, maxval=50.0, step=1.0, group=grp_regime)
+useORBFilter    = input.bool(true, "Enable Opening Range Filter", group=grp_regime)
+orbMinutes      = input.int(15, "Opening Range Period (minutes)", minval=5, maxval=60, step=5, group=grp_regime)
+orbATRMult      = input.float(1.5, "ORB Width / ATR Threshold", minval=0.5, maxval=4.0, step=0.1, group=grp_regime, tooltip="If opening range > this × ATR, likely trend day — skip trades.")
+
+// -- Volume Exhaustion --
+grp_vol = "Volume Filter"
+useVolFilter    = input.bool(true, "Enable Volume Exhaustion Filter", group=grp_vol)
+volLookback     = input.int(10, "Volume SMA Lookback", minval=3, maxval=50, group=grp_vol)
+volThreshold    = input.float(1.0, "Volume Ratio Threshold", minval=0.3, maxval=2.0, step=0.1, group=grp_vol, tooltip="Entry only when volume < this × SMA. Below 1.0 = exhaustion move.")
+
+// -- Entry Confirmation --
+grp_entry = "Entry Logic"
+useRejectionCandle = input.bool(true, "Require Rejection Candle", group=grp_entry, tooltip="Price must wick beyond band but close back inside.")
+maxDailyTrades  = input.int(4, "Max Trades Per Day", minval=1, maxval=20, group=grp_entry)
+
+// -- Risk Management --
+grp_risk = "Risk Management"
+stopATRMult     = input.float(0.3, "Stop Loss (ATR multiplier beyond band)", minval=0.05, maxval=2.0, step=0.05, group=grp_risk)
+tp1Pct          = input.float(50.0, "TP1 Close % (at inner band)", minval=10.0, maxval=90.0, step=5.0, group=grp_risk)
+atrLength       = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_risk)
+
+// -- Session Filter --
+grp_session = "Session"
+sessionStart    = input.session("0930-1545", "Trading Session", group=grp_session, tooltip="Eastern Time. Avoids first/last 15 min by default.")
+
+// -- TradersPost --
+grp_tp = "TradersPost Webhooks"
+enableAlerts    = input.bool(true, "Enable TradersPost Alerts", group=grp_tp)
+
+// ─────────────────────────────────────────────
+// 📐 VWAP + STANDARD DEVIATION BANDS
+// ─────────────────────────────────────────────
+
+// PineScript's built-in ta.vwap only gives the line, not bands.
+// We calculate manually for full control over the σ bands.
+
+var float sumPV      = 0.0   // cumulative price × volume
+var float sumVol     = 0.0   // cumulative volume
+var float sumPV2     = 0.0   // cumulative price² × volume (for variance)
+
+// Reset at session start (new day)
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    sumPV  := 0.0
+    sumVol := 0.0
+    sumPV2 := 0.0
+
+sumPV  += vwapSource * volume
+sumVol += volume
+sumPV2 += vwapSource * vwapSource * volume
+
+vwapValue = sumVol != 0 ? sumPV / sumVol : close
+variance  = sumVol != 0 ? (sumPV2 / sumVol) - (vwapValue * vwapValue) : 0.0
+stdev     = math.sqrt(math.max(variance, 0))
+
+// Bands
+upperEntry = vwapValue + entryBandMult * stdev
+lowerEntry = vwapValue - entryBandMult * stdev
+upperInner = vwapValue + innerBandMult * stdev
+lowerInner = vwapValue - innerBandMult * stdev
+
+// Plot VWAP and bands
+plot(vwapValue, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
+p_ue = plot(upperEntry, "Upper Entry Band", color=color.new(color.red, 40))
+p_le = plot(lowerEntry, "Lower Entry Band", color=color.new(color.green, 40))
+plot(upperInner, "Upper Inner Band", color=color.new(color.red, 70), style=plot.style_circles)
+plot(lowerInner, "Lower Inner Band", color=color.new(color.green, 70), style=plot.style_circles)
+fill(p_ue, p_le, color=color.new(color.gray, 92), title="VWAP Band Fill")
+
+// ─────────────────────────────────────────────
+// 📊 ADX REGIME FILTER
+// ─────────────────────────────────────────────
+
+// Wilder's ADX calculation
+trueRange   = ta.tr(true)
+plusDM       = high - high[1] > low[1] - low ? math.max(high - high[1], 0) : 0.0
+minusDM     = low[1] - low > high - high[1] ? math.max(low[1] - low, 0) : 0.0
+
+smoothTR    = ta.rma(trueRange, adxLen)
+smoothPlusDM  = ta.rma(plusDM, adxLen)
+smoothMinusDM = ta.rma(minusDM, adxLen)
+
+plusDI       = smoothTR != 0 ? 100 * smoothPlusDM / smoothTR : 0.0
+minusDI      = smoothTR != 0 ? 100 * smoothMinusDM / smoothTR : 0.0
+dx           = (plusDI + minusDI) != 0 ? 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0.0
+adxValue     = ta.rma(dx, adxLen)
+
+adxOK = useADXFilter ? adxValue < adxThreshold : true
+
+// ─────────────────────────────────────────────
+// 📏 OPENING RANGE BREAKOUT FILTER
+// ─────────────────────────────────────────────
+
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbSet  = false
+atrVal = ta.atr(atrLength)
+
+// Determine bar duration in minutes (approximate)
+barMins = timeframe.in_seconds(timeframe.period) / 60
+
+// ORB bars = how many bars make up the opening range
+orbBars = barMins > 0 ? math.ceil(orbMinutes / barMins) : 3
+
+// Count bars since session start
+var int barsFromOpen = 0
+if isNewDay
+    barsFromOpen := 0
+    orbHigh      := high
+    orbLow       := low
+    orbSet       := false
+else
+    barsFromOpen += 1
+
+// Build opening range
+if barsFromOpen < orbBars and not orbSet
+    orbHigh := math.max(nz(orbHigh, high), high)
+    orbLow  := math.min(nz(orbLow, low), low)
+if barsFromOpen == orbBars and not orbSet
+    orbSet := true
+
+orbWidth = orbSet ? (orbHigh - orbLow) : 0.0
+orbIsTrendDay = orbSet and atrVal > 0 and (orbWidth > orbATRMult * atrVal)
+orbOK = useORBFilter ? (orbSet and not orbIsTrendDay) : true
+
+// ─────────────────────────────────────────────
+// 🔊 VOLUME EXHAUSTION FILTER
+// ─────────────────────────────────────────────
+
+volSMA   = ta.sma(volume, volLookback)
+volRatio = volSMA != 0 ? volume / volSMA : 1.0
+volOK    = useVolFilter ? volRatio < volThreshold : true
+
+// ─────────────────────────────────────────────
+// 🕯️ REJECTION CANDLE DETECTION
+// ─────────────────────────────────────────────
+
+// Bearish rejection at upper band: wick above band, close below it
+upperRejection = useRejectionCandle ? (high > upperEntry and close < upperEntry) : (high > upperEntry)
+
+// Bullish rejection at lower band: wick below band, close above it
+lowerRejection = useRejectionCandle ? (low < lowerEntry and close > lowerEntry) : (low < lowerEntry)
+
+// ─────────────────────────────────────────────
+// ⏰ SESSION & DAILY TRADE COUNTER
+// ─────────────────────────────────────────────
+
+inSession = not na(time(timeframe.period, sessionStart))
+
+var int dailyTradeCount = 0
+if isNewDay
+    dailyTradeCount := 0
+
+canTrade = inSession and dailyTradeCount < maxDailyTrades
+
+// ─────────────────────────────────────────────
+// 🎯 ENTRY CONDITIONS
+// ─────────────────────────────────────────────
+
+// Confirm bar is closed (avoid intra-bar signals)
+confirmed = barstate.isconfirmed
+
+// All regime filters must pass
+regimeOK = adxOK and orbOK
+
+// LONG: price rejected at lower band + volume exhaustion + regime OK
+longCondition  = confirmed and canTrade and regimeOK and volOK and lowerRejection and strategy.position_size == 0
+
+// SHORT: price rejected at upper band + volume exhaustion + regime OK  
+shortCondition = confirmed and canTrade and regimeOK and volOK and upperRejection and strategy.position_size == 0
+
+// ─────────────────────────────────────────────
+// 📍 STOP LOSS & TAKE PROFIT LEVELS
+// ─────────────────────────────────────────────
+
+var float longStop  = na
+var float longTP1   = na
+var float longTP2   = na
+var float shortStop = na
+var float shortTP1  = na
+var float shortTP2  = na
+
+if longCondition
+    longStop  := lowerEntry - (stopATRMult * atrVal)
+    longTP1   := lowerInner   // inner band (partial close)
+    longTP2   := vwapValue    // VWAP (full close)
+    dailyTradeCount += 1
+
+if shortCondition
+    shortStop := upperEntry + (stopATRMult * atrVal)
+    shortTP1  := upperInner   // inner band (partial close)
+    shortTP2  := vwapValue    // VWAP (full close)
+    dailyTradeCount += 1
+
+// ─────────────────────────────────────────────
+// 🚀 EXECUTE TRADES
+// ─────────────────────────────────────────────
+
+if longCondition
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP1", from_entry="Long", qty_percent=tp1Pct, limit=longTP1, stop=longStop)
+    strategy.exit("Long TP2", from_entry="Long", limit=longTP2, stop=longStop)
+
+if shortCondition
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP1", from_entry="Short", qty_percent=tp1Pct, limit=shortTP1, stop=shortStop)
+    strategy.exit("Short TP2", from_entry="Short", limit=shortTP2, stop=shortStop)
+
+// ─────────────────────────────────────────────
+// 🔔 END-OF-DAY FLATTEN
+// ─────────────────────────────────────────────
+
+// Close all positions at session end to avoid overnight risk
+if not inSession and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flatten")
+
+// ─────────────────────────────────────────────
+// 🔔 TRADERSPOST WEBHOOK ALERTS
+// ─────────────────────────────────────────────
+
+// TradersPost expects JSON payloads. These alerts are configured
+// to fire on strategy order fills. In TradingView:
+//   1. Create alert on this strategy
+//   2. Set webhook URL to your TradersPost webhook
+//   3. Use the message template below
+
+// Alert conditions for TradersPost integration
+if enableAlerts and longCondition
+    alert('{"action":"buy","sentiment":"bullish","ticker":"{{ticker}}","price":{{close}}}', alert.freq_once_per_bar_close)
+
+if enableAlerts and shortCondition
+    alert('{"action":"sell","sentiment":"bearish","ticker":"{{ticker}}","price":{{close}}}', alert.freq_once_per_bar_close)
+
+if enableAlerts and not inSession and strategy.position_size != 0
+    alert('{"action":"exit","sentiment":"flat","ticker":"{{ticker}}","price":{{close}}}', alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────
+// 📊 DASHBOARD TABLE
+// ─────────────────────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 8, 
+     bgcolor=color.new(color.black, 80), 
+     border_color=color.new(color.gray, 60), 
+     border_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Metric",       text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 0, "Value",         text_color=color.gray, text_size=size.small)
+    
+    table.cell(dash, 0, 1, "ADX",           text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(adxValue, "#.#"), 
+         text_color=adxOK ? color.green : color.red, text_size=size.small)
+    
+    table.cell(dash, 0, 2, "Regime",        text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, regimeOK ? "RANGE ✓" : "TREND ✗", 
+         text_color=regimeOK ? color.green : color.red, text_size=size.small)
+    
+    table.cell(dash, 0, 3, "Vol Ratio",     text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(volRatio, "#.##"), 
+         text_color=volOK ? color.green : color.orange, text_size=size.small)
+    
+    table.cell(dash, 0, 4, "ORB Width",     text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, orbSet ? str.tostring(orbWidth, "#.##") : "building...", 
+         text_color=orbOK ? color.green : color.red, text_size=size.small)
+    
+    table.cell(dash, 0, 5, "Session",       text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, inSession ? "ACTIVE" : "CLOSED", 
+         text_color=inSession ? color.green : color.gray, text_size=size.small)
+    
+    table.cell(dash, 0, 6, "Trades Today",  text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, str.tostring(dailyTradeCount) + " / " + str.tostring(maxDailyTrades), 
+         text_color=canTrade ? color.green : color.orange, text_size=size.small)
+    
+    table.cell(dash, 0, 7, "Position",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", 
+         text_color=strategy.position_size != 0 ? color.yellow : color.gray, text_size=size.small)
+
+// ─────────────────────────────────────────────
+// 🎨 ENTRY MARKERS
+// ─────────────────────────────────────────────
+
+plotshape(longCondition,  title="Long Entry",  location=location.belowbar, style=shape.triangleup,   color=color.green, size=size.small, text="L")
+plotshape(shortCondition, title="Short Entry",  location=location.abovebar, style=shape.triangledown, color=color.red,   size=size.small, text="S")
+
+// ─────────────────────────────────────────────
+// 🛈 USAGE NOTES
+// ─────────────────────────────────────────────
+// 
+// RECOMMENDED SETTINGS BY TIMEFRAME:
+//   1m  chart → Entry Band: 2.0σ, ADX Len: 10, Vol Lookback: 15
+//   5m  chart → Entry Band: 1.5σ, ADX Len: 14, Vol Lookback: 10 (default)
+//   15m chart → Entry Band: 1.5σ, ADX Len: 14, Vol Lookback: 8
+//
+// TRADERSPOST SETUP:
+//   1. In TradingView, right-click the strategy → "Add Alert"
+//   2. Condition: strategy orders (any)
+//   3. Webhook URL: paste your TradersPost webhook
+//   4. The JSON payloads above auto-populate via alert() calls
+//
+// BACKTEST TIPS:
+//   - Run on 5m SPY first to validate logic
+//   - Check Strategy Tester → Performance Summary for win rate & profit factor
+//   - Compare with "Buy & Hold" to confirm alpha
+//   - Slippage is set to 1 tick; increase to 2 for less liquid instruments
+//
+// KNOWN LIMITATIONS:
+//   - TradingView backtest assumes instant fills at bar close
+//   - VWAP resets daily; not suitable for 24h crypto without modification
+//   - Multi-asset scanning requires separate chart instances per symbol
+

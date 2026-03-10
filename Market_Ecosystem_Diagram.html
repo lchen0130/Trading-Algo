@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Market Ecosystem — Players & Interactions</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0F172A; color: #E2E8F0; overflow-x: hidden; }
+
+  .header { text-align: center; padding: 32px 20px 16px; }
+  .header h1 { font-size: 28px; font-weight: 700; color: #F8FAFC; letter-spacing: -0.5px; }
+  .header p { font-size: 14px; color: #94A3B8; margin-top: 6px; }
+
+  .legend { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; padding: 8px 20px 20px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #94A3B8; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .legend-line { width: 24px; height: 3px; border-radius: 2px; }
+
+  .diagram-container {
+    position: relative;
+    width: 1100px;
+    height: 820px;
+    margin: 0 auto 40px;
+  }
+
+  svg.connections {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .node {
+    position: absolute;
+    border-radius: 12px;
+    padding: 14px 18px;
+    text-align: center;
+    z-index: 10;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+    border: 1.5px solid rgba(255,255,255,0.08);
+  }
+  .node:hover {
+    transform: scale(1.05);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    z-index: 20;
+  }
+  .node h3 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .node p { font-size: 11px; line-height: 1.4; opacity: 0.85; }
+  .node .examples { font-size: 10px; opacity: 0.6; margin-top: 4px; font-style: italic; }
+
+  /* Color themes per category */
+  .node.retail { background: linear-gradient(135deg, #1E3A5F, #1E293B); border-color: #3B82F6; }
+  .node.retail h3 { color: #60A5FA; }
+  .node.institutional { background: linear-gradient(135deg, #1E3B3E, #1E293B); border-color: #14B8A6; }
+  .node.institutional h3 { color: #5EEAD4; }
+  .node.infrastructure { background: linear-gradient(135deg, #2D1F3D, #1E293B); border-color: #A78BFA; }
+  .node.infrastructure h3 { color: #C4B5FD; }
+  .node.intermediary { background: linear-gradient(135deg, #3B2F1A, #1E293B); border-color: #F59E0B; }
+  .node.intermediary h3 { color: #FCD34D; }
+  .node.regulator { background: linear-gradient(135deg, #3B1A1A, #1E293B); border-color: #EF4444; }
+  .node.regulator h3 { color: #FCA5A5; }
+  .node.data { background: linear-gradient(135deg, #1A2F3B, #1E293B); border-color: #06B6D4; }
+  .node.data h3 { color: #67E8F9; }
+
+  /* Tooltip */
+  .tooltip {
+    display: none;
+    position: absolute;
+    background: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    padding: 16px 18px;
+    max-width: 320px;
+    z-index: 100;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    pointer-events: none;
+  }
+  .tooltip.visible { display: block; }
+  .tooltip h4 { font-size: 14px; margin-bottom: 8px; color: #F8FAFC; }
+  .tooltip p { font-size: 12px; line-height: 1.5; color: #CBD5E1; }
+  .tooltip .flow-item { padding: 4px 0; border-bottom: 1px solid #334155; }
+  .tooltip .flow-item:last-child { border-bottom: none; }
+  .tooltip .flow-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .tooltip .flow-label.sends { color: #F87171; }
+  .tooltip .flow-label.receives { color: #34D399; }
+
+  /* Flow labels on arrows */
+  .flow-text {
+    font-size: 10px;
+    fill: #94A3B8;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    pointer-events: none;
+  }
+  .flow-text.fee { fill: #F87171; }
+  .flow-text.rebate { fill: #34D399; }
+  .flow-text.orders { fill: #60A5FA; }
+  .flow-text.data { fill: #67E8F9; }
+  .flow-text.regulation { fill: #FCA5A5; }
+
+  /* Section labels */
+  .section-label {
+    position: absolute;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #475569;
+    z-index: 0;
+  }
+
+  /* Bottom info panel */
+  .info-panel {
+    max-width: 1100px;
+    margin: 0 auto 40px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    padding: 0 20px;
+  }
+  .info-card {
+    background: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .info-card h4 {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+  .info-card p { font-size: 12px; line-height: 1.6; color: #94A3B8; }
+  .info-card.orders-card h4 { color: #60A5FA; }
+  .info-card.money-card h4 { color: #34D399; }
+  .info-card.data-card h4 { color: #67E8F9; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Trading Market Ecosystem</h1>
+  <p>How players interact — order flow, fees, data, and regulation</p>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#3B82F6"></div> Retail</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#14B8A6"></div> Institutional</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div> Intermediary</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#A78BFA"></div> Infrastructure</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#06B6D4"></div> Data</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#EF4444"></div> Regulator</div>
+  <div class="legend-item"><div class="legend-line" style="background:#60A5FA"></div> Order Flow</div>
+  <div class="legend-item"><div class="legend-line" style="background:#34D399"></div> Money / Fees</div>
+  <div class="legend-item"><div class="legend-line" style="background:#67E8F9"></div> Data</div>
+  <div class="legend-item"><div class="legend-line" style="background:#FCA5A5; height:2px; border-top: 1px dashed #FCA5A5; background:none;"></div> Regulation</div>
+</div>
+
+<div class="diagram-container" id="diagram">
+
+  <!-- Section labels -->
+  <div class="section-label" style="top: 8px; left: 20px;">MARKET PARTICIPANTS</div>
+  <div class="section-label" style="top: 8px; right: 20px;">INFRASTRUCTURE</div>
+  <div class="section-label" style="bottom: 8px; left: 20px;">OVERSIGHT &amp; DATA</div>
+
+  <!-- === NODES === -->
+
+  <!-- Retail Investor -->
+  <div class="node retail" id="retail" style="top: 50px; left: 30px; width: 180px;"
+       data-tooltip="retail-tip">
+    <h3>Retail Investors</h3>
+    <p>Individual traders placing orders through broker apps</p>
+    <div class="examples">Robinhood, Schwab, Fidelity users</div>
+  </div>
+
+  <!-- Retail Broker -->
+  <div class="node intermediary" id="broker" style="top: 50px; left: 260px; width: 190px;"
+       data-tooltip="broker-tip">
+    <h3>Retail Brokers</h3>
+    <p>Route retail orders; earn PFOF from wholesalers</p>
+    <div class="examples">Robinhood, Schwab, Fidelity, IBKR</div>
+  </div>
+
+  <!-- Wholesaler -->
+  <div class="node intermediary" id="wholesaler" style="top: 50px; left: 500px; width: 200px;"
+       data-tooltip="wholesaler-tip">
+    <h3>Wholesalers</h3>
+    <p>Internalize ~90% of retail orders off-exchange; pay PFOF to brokers</p>
+    <div class="examples">Citadel Securities, Virtu, G1X</div>
+  </div>
+
+  <!-- Institutional Investor -->
+  <div class="node institutional" id="institutional" style="top: 200px; left: 30px; width: 180px;"
+       data-tooltip="inst-tip">
+    <h3>Institutional Investors</h3>
+    <p>Large funds executing via execution algos and direct market access</p>
+    <div class="examples">Pension funds, mutual funds, ETFs</div>
+  </div>
+
+  <!-- Hedge Funds / Quants -->
+  <div class="node institutional" id="hedgefunds" style="top: 200px; left: 260px; width: 190px;"
+       data-tooltip="hf-tip">
+    <h3>Hedge Funds &amp; Quants</h3>
+    <p>Alpha-seeking strategies; consume liquidity as takers</p>
+    <div class="examples">Renaissance, Two Sigma, DE Shaw, Citadel</div>
+  </div>
+
+  <!-- Market Makers -->
+  <div class="node intermediary" id="marketmaker" style="top: 200px; left: 500px; width: 200px;"
+       data-tooltip="mm-tip">
+    <h3>Market Makers</h3>
+    <p>Post continuous bids/asks; earn spread + maker rebates</p>
+    <div class="examples">Citadel Securities, Virtu, Jane Street, GTS, Optiver</div>
+  </div>
+
+  <!-- HFT Firms -->
+  <div class="node institutional" id="hft" style="top: 200px; left: 750px; width: 180px;"
+       data-tooltip="hft-tip">
+    <h3>HFT Firms</h3>
+    <p>Ultra-low latency strategies; latency arb, rebate arb, event-driven</p>
+    <div class="examples">Jump Trading, Tower Research, Hudson River</div>
+  </div>
+
+  <!-- Lit Exchanges -->
+  <div class="node infrastructure" id="exchange" style="top: 390px; left: 250px; width: 220px;"
+       data-tooltip="exchange-tip">
+    <h3>Lit Exchanges</h3>
+    <p>Public order books; operate maker-taker fee model; match orders</p>
+    <div class="examples">NYSE, NASDAQ, CBOE, IEX, BATS/Cboe BZX</div>
+  </div>
+
+  <!-- Dark Pools -->
+  <div class="node infrastructure" id="darkpool" style="top: 390px; left: 530px; width: 200px;"
+       data-tooltip="dark-tip">
+    <h3>Dark Pools</h3>
+    <p>Private venues; hide order info to reduce market impact</p>
+    <div class="examples">Liquidnet, Sigma X, CrossFinder, MS Pool</div>
+  </div>
+
+  <!-- Clearing Houses -->
+  <div class="node infrastructure" id="clearing" style="top: 390px; left: 790px; width: 180px;"
+       data-tooltip="clearing-tip">
+    <h3>Clearinghouses</h3>
+    <p>Guarantee trade settlement; manage counterparty risk</p>
+    <div class="examples">DTCC (NSCC), OCC, CME Clearing</div>
+  </div>
+
+  <!-- Prime Brokers -->
+  <div class="node intermediary" id="primebroker" style="top: 390px; left: 20px; width: 180px;"
+       data-tooltip="pb-tip">
+    <h3>Prime Brokers</h3>
+    <p>Provide leverage, lending, and clearing to hedge funds</p>
+    <div class="examples">Goldman Sachs, Morgan Stanley, JPMorgan</div>
+  </div>
+
+  <!-- Data Vendors -->
+  <div class="node data" id="datavendor" style="top: 570px; left: 30px; width: 180px;"
+       data-tooltip="data-tip">
+    <h3>Data Vendors</h3>
+    <p>Provide market data, fundamentals, and alternative data feeds</p>
+    <div class="examples">Bloomberg, Refinitiv, Polygon.io, Quandl</div>
+  </div>
+
+  <!-- Alt Data Providers -->
+  <div class="node data" id="altdata" style="top: 570px; left: 260px; width: 190px;"
+       data-tooltip="alt-tip">
+    <h3>Alternative Data</h3>
+    <p>Non-traditional datasets for informational edge</p>
+    <div class="examples">Satellite imagery, credit cards, web scraping, NLP</div>
+  </div>
+
+  <!-- Regulators -->
+  <div class="node regulator" id="regulator" style="top: 570px; left: 500px; width: 200px;"
+       data-tooltip="reg-tip">
+    <h3>Regulators</h3>
+    <p>Set rules, enforce compliance, audit trails, market surveillance</p>
+    <div class="examples">SEC, FINRA, CFTC, MiFID II (EU)</div>
+  </div>
+
+  <!-- SIP / Consolidated Tape -->
+  <div class="node infrastructure" id="sip" style="top: 570px; left: 750px; width: 180px;"
+       data-tooltip="sip-tip">
+    <h3>SIP / Consolidated Tape</h3>
+    <p>Aggregates NBBO quotes from all exchanges into one feed</p>
+    <div class="examples">CTA/CQ Plan, UTP Plan</div>
+  </div>
+
+  <!-- SVG Connections -->
+  <svg class="connections" viewBox="0 0 1100 820">
+    <defs>
+      <marker id="arrow-blue" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#60A5FA"/></marker>
+      <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#34D399"/></marker>
+      <marker id="arrow-cyan" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#67E8F9"/></marker>
+      <marker id="arrow-red" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#FCA5A5"/></marker>
+    </defs>
+
+    <!-- Retail → Broker (orders) -->
+    <line x1="210" y1="85" x2="258" y2="85" stroke="#60A5FA" stroke-width="2" marker-end="url(#arrow-blue)" opacity="0.7"/>
+    <text x="222" y="78" class="flow-text orders">orders</text>
+
+    <!-- Broker → Wholesaler (orders, ~90%) -->
+    <line x1="450" y1="75" x2="498" y2="75" stroke="#60A5FA" stroke-width="2.5" marker-end="url(#arrow-blue)" opacity="0.8"/>
+    <text x="456" y="68" class="flow-text orders">~90% of retail orders</text>
+
+    <!-- Wholesaler → Broker (PFOF $$$) -->
+    <line x1="498" y1="100" x2="450" y2="100" stroke="#34D399" stroke-width="1.5" marker-end="url(#arrow-green)" opacity="0.7"/>
+    <text x="454" y="116" class="flow-text rebate">PFOF payments</text>
+
+    <!-- Wholesaler → Retail (price improvement) -->
+    <path d="M 500 130 Q 350 170 210 105" stroke="#34D399" stroke-width="1" fill="none" marker-end="url(#arrow-green)" opacity="0.5" stroke-dasharray="4,3"/>
+    <text x="310" y="148" class="flow-text rebate">price improvement</text>
+
+    <!-- Broker → Exchange (remaining ~10%) -->
+    <path d="M 355 130 Q 355 260 350 388" stroke="#60A5FA" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)" opacity="0.5"/>
+    <text x="362" y="270" class="flow-text orders">~10%</text>
+
+    <!-- Institutional → Prime Broker -->
+    <path d="M 90 275 Q 80 340 100 388" stroke="#60A5FA" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)" opacity="0.6"/>
+
+    <!-- Institutional → Exchange (via execution algos) -->
+    <path d="M 175 275 Q 260 340 310 388" stroke="#60A5FA" stroke-width="2" fill="none" marker-end="url(#arrow-blue)" opacity="0.7"/>
+    <text x="200" y="335" class="flow-text orders">VWAP/TWAP/SOR</text>
+
+    <!-- Institutional → Dark Pool -->
+    <path d="M 180 270 Q 400 340 580 388" stroke="#60A5FA" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)" opacity="0.5" stroke-dasharray="5,3"/>
+    <text x="380" y="325" class="flow-text orders">large block orders</text>
+
+    <!-- Hedge Funds → Exchange -->
+    <path d="M 355 275 Q 360 330 360 388" stroke="#60A5FA" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)" opacity="0.6"/>
+
+    <!-- Market Makers → Exchange (post limit orders) -->
+    <path d="M 580 275 Q 500 330 420 388" stroke="#60A5FA" stroke-width="2.5" fill="none" marker-end="url(#arrow-blue)" opacity="0.8"/>
+    <text x="470" y="310" class="flow-text orders">limit orders (make)</text>
+
+    <!-- Exchange → Market Makers (rebates) -->
+    <path d="M 430 388 Q 510 320 590 275" stroke="#34D399" stroke-width="1.5" fill="none" marker-end="url(#arrow-green)" opacity="0.6"/>
+    <text x="520" y="345" class="flow-text rebate">maker rebates</text>
+
+    <!-- HFT → Exchange (high-speed orders) -->
+    <path d="M 840 275 Q 700 330 460 400" stroke="#60A5FA" stroke-width="2" fill="none" marker-end="url(#arrow-blue)" opacity="0.7"/>
+    <text x="650" y="315" class="flow-text orders">µs-speed orders</text>
+
+    <!-- Exchange → HFT (rebates) -->
+    <path d="M 470 410 Q 710 350 845 275" stroke="#34D399" stroke-width="1" fill="none" marker-end="url(#arrow-green)" opacity="0.5"/>
+    <text x="700" y="365" class="flow-text rebate">rebates</text>
+
+    <!-- Exchange → Takers (fee arrows) -->
+    <text x="280" y="420" class="flow-text fee" style="font-size:9px">taker fees charged →</text>
+
+    <!-- Exchange → Clearing -->
+    <line x1="470" y1="430" x2="788" y2="430" stroke="#A78BFA" stroke-width="1.5" marker-end="url(#arrow-blue)" opacity="0.4"/>
+    <text x="590" y="448" class="flow-text" style="fill:#C4B5FD">all trades settle here</text>
+
+    <!-- Dark Pool → Clearing -->
+    <line x1="730" y1="430" x2="788" y2="430" stroke="#A78BFA" stroke-width="1" opacity="0.3"/>
+
+    <!-- Exchange → SIP (quotes) -->
+    <path d="M 400 470 Q 550 550 748 600" stroke="#67E8F9" stroke-width="1.5" fill="none" marker-end="url(#arrow-cyan)" opacity="0.5"/>
+    <text x="530" y="540" class="flow-text data">NBBO quotes</text>
+
+    <!-- SIP → Everyone (market data) -->
+    <path d="M 750 600 Q 400 560 180 520" stroke="#67E8F9" stroke-width="1" fill="none" marker-end="url(#arrow-cyan)" opacity="0.3" stroke-dasharray="4,3"/>
+
+    <!-- Data Vendors → Institutional/HF -->
+    <path d="M 120 570 Q 120 400 160 275" stroke="#67E8F9" stroke-width="1.5" fill="none" marker-end="url(#arrow-cyan)" opacity="0.5"/>
+    <text x="80" y="420" class="flow-text data">market data</text>
+
+    <!-- Data Vendors → HF -->
+    <path d="M 180 570 Q 300 450 340 275" stroke="#67E8F9" stroke-width="1" fill="none" marker-end="url(#arrow-cyan)" opacity="0.4"/>
+
+    <!-- Alt Data → Hedge Funds -->
+    <path d="M 355 570 Q 355 430 355 275" stroke="#67E8F9" stroke-width="1.5" fill="none" marker-end="url(#arrow-cyan)" opacity="0.5"/>
+    <text x="362" y="500" class="flow-text data">alt data signals</text>
+
+    <!-- Regulator oversight (dashed to exchanges) -->
+    <path d="M 600 570 Q 500 500 420 470" stroke="#FCA5A5" stroke-width="1.5" fill="none" marker-end="url(#arrow-red)" opacity="0.5" stroke-dasharray="6,4"/>
+    <text x="470" y="520" class="flow-text regulation">oversight</text>
+
+    <!-- Regulator → Dark Pools -->
+    <path d="M 650 570 Q 650 510 640 470" stroke="#FCA5A5" stroke-width="1" fill="none" marker-end="url(#arrow-red)" opacity="0.4" stroke-dasharray="6,4"/>
+
+    <!-- Regulator → Brokers -->
+    <path d="M 550 570 Q 420 400 370 130" stroke="#FCA5A5" stroke-width="1" fill="none" marker-end="url(#arrow-red)" opacity="0.3" stroke-dasharray="6,4"/>
+    <text x="415" y="380" class="flow-text regulation" style="font-size:9px">best execution rules</text>
+
+    <!-- Regulator → HFT -->
+    <path d="M 700 580 Q 790 460 840 275" stroke="#FCA5A5" stroke-width="1" fill="none" marker-end="url(#arrow-red)" opacity="0.3" stroke-dasharray="6,4"/>
+
+  </svg>
+
+  <!-- Tooltip container -->
+  <div class="tooltip" id="tooltip"></div>
+</div>
+
+<!-- Info panel -->
+<div class="info-panel">
+  <div class="info-card orders-card">
+    <h4>Order Flow</h4>
+    <p>Retail orders travel: <strong>Investor → Broker → Wholesaler</strong> (~90% internalized off-exchange) or <strong>→ Exchange</strong> (~10%). Institutional orders go directly to exchanges or dark pools via execution algorithms (VWAP, TWAP, SOR). Market makers and HFT firms post limit orders to exchanges, earning maker rebates.</p>
+  </div>
+  <div class="info-card money-card">
+    <h4>Money &amp; Fee Flow</h4>
+    <p><strong>Maker-Taker Model:</strong> Exchanges pay ~$0.002/share rebates to limit order posters (makers) and charge ~$0.003/share to market order senders (takers). <strong>PFOF:</strong> Wholesalers pay brokers for retail order flow (~$0.002-0.004/share). Retail investors receive price improvement (~$0.01/share) but their orders never reach public exchanges.</p>
+  </div>
+  <div class="info-card data-card">
+    <h4>Data &amp; Regulation</h4>
+    <p>The <strong>SIP (Securities Information Processor)</strong> consolidates quotes from all exchanges into the NBBO. Data vendors (Bloomberg, Refinitiv) distribute market data, while alternative data providers sell satellite imagery, credit card data, and NLP signals. <strong>SEC, FINRA, and CFTC</strong> oversee all participants with rules on best execution, risk controls, and audit trails.</p>
+  </div>
+</div>
+
+<script>
+// Tooltip data for each node
+const tooltips = {
+  'retail': {
+    title: 'Retail Investors',
+    flows: [
+      { dir: 'sends', text: 'Orders to broker (Robinhood, Schwab, etc.)' },
+      { dir: 'receives', text: 'Price improvement from wholesalers (~$0.01/share avg)' },
+      { dir: 'receives', text: 'Commission-free trading (broker earns via PFOF instead)' },
+      { dir: 'sends', text: '"Uninformed" flow — low adverse selection risk for counterparties' }
+    ]
+  },
+  'broker': {
+    title: 'Retail Brokers',
+    flows: [
+      { dir: 'receives', text: 'Orders from retail investors' },
+      { dir: 'sends', text: '~90% of marketable retail orders routed to wholesalers' },
+      { dir: 'sends', text: '~10% of orders sent to lit exchanges' },
+      { dir: 'receives', text: 'PFOF from wholesalers ($0.002-0.004/share)' },
+      { dir: 'receives', text: 'Regulatory obligation: best execution (SEC Rule 606)' }
+    ]
+  },
+  'wholesaler': {
+    title: 'Wholesalers (Off-Exchange)',
+    flows: [
+      { dir: 'receives', text: '~90% of retail equity orders in the U.S.' },
+      { dir: 'sends', text: 'PFOF to brokers for order flow access' },
+      { dir: 'sends', text: 'Price improvement to retail (better than NBBO)' },
+      { dir: 'sends', text: 'Profit from spread between internalized buy/sell flow' },
+      { dir: 'receives', text: 'Citadel Securities handles ~25-40% of all U.S. retail volume' }
+    ]
+  },
+  'institutional': {
+    title: 'Institutional Investors',
+    flows: [
+      { dir: 'sends', text: 'Large orders via VWAP, TWAP, Implementation Shortfall algos' },
+      { dir: 'sends', text: 'Block trades to dark pools to minimize market impact' },
+      { dir: 'receives', text: 'Leverage and clearing from prime brokers' },
+      { dir: 'sends', text: 'Taker fees to exchanges when using market orders' }
+    ]
+  },
+  'hedgefunds': {
+    title: 'Hedge Funds & Quant Firms',
+    flows: [
+      { dir: 'sends', text: 'Alpha-seeking orders to exchanges (mostly as takers)' },
+      { dir: 'receives', text: 'Market data + alternative data for signal generation' },
+      { dir: 'receives', text: 'Leverage and securities lending from prime brokers' },
+      { dir: 'sends', text: '"Informed" flow — high adverse selection risk for market makers' }
+    ]
+  },
+  'marketmaker': {
+    title: 'Market Makers',
+    flows: [
+      { dir: 'sends', text: 'Continuous two-sided quotes (bids + asks) to exchanges' },
+      { dir: 'receives', text: 'Maker rebates from exchanges (~$0.002/share)' },
+      { dir: 'receives', text: 'Spread profit (buy at bid, sell at ask)' },
+      { dir: 'sends', text: 'Liquidity — always willing to buy or sell' },
+      { dir: 'receives', text: 'Adverse selection losses from informed traders' }
+    ]
+  },
+  'hft': {
+    title: 'HFT Firms',
+    flows: [
+      { dir: 'sends', text: 'Microsecond-speed orders to co-located exchange servers' },
+      { dir: 'receives', text: 'Maker rebates from rebate arbitrage strategies' },
+      { dir: 'receives', text: 'Latency arb profits from cross-exchange price differences' },
+      { dir: 'sends', text: 'Co-location fees ($15K+/month per rack at CME Aurora)' },
+      { dir: 'receives', text: 'Direct market data feeds (faster than SIP)' }
+    ]
+  },
+  'exchange': {
+    title: 'Lit Exchanges (Public Order Books)',
+    flows: [
+      { dir: 'receives', text: 'Limit orders from market makers (makers)' },
+      { dir: 'receives', text: 'Market orders from institutional/retail (takers)' },
+      { dir: 'sends', text: 'Rebates to makers (~$0.002/share)' },
+      { dir: 'receives', text: 'Fees from takers (~$0.003/share)' },
+      { dir: 'sends', text: 'NBBO quotes to SIP consolidated tape' },
+      { dir: 'sends', text: 'All matched trades to clearinghouse for settlement' }
+    ]
+  },
+  'darkpool': {
+    title: 'Dark Pools (Private Venues)',
+    flows: [
+      { dir: 'receives', text: 'Large institutional block orders' },
+      { dir: 'sends', text: 'Anonymity — order sizes hidden from public view' },
+      { dir: 'sends', text: 'Reduced market impact for large trades' },
+      { dir: 'receives', text: 'SEC oversight (ATS registration required)' }
+    ]
+  },
+  'clearing': {
+    title: 'Clearinghouses',
+    flows: [
+      { dir: 'receives', text: 'All matched trades from exchanges and dark pools' },
+      { dir: 'sends', text: 'Guaranteed settlement (T+1 for U.S. equities as of 2024)' },
+      { dir: 'sends', text: 'Counterparty risk management via margin and netting' },
+      { dir: 'receives', text: 'Clearing fees from all participants' }
+    ]
+  },
+  'primebroker': {
+    title: 'Prime Brokers',
+    flows: [
+      { dir: 'receives', text: 'Fees for leverage, lending, and clearing services' },
+      { dir: 'sends', text: 'Margin/leverage to hedge funds (up to 6:1 or more)' },
+      { dir: 'sends', text: 'Securities lending for short selling' },
+      { dir: 'sends', text: 'Consolidated reporting and trade clearing' }
+    ]
+  },
+  'datavendor': {
+    title: 'Data Vendors',
+    flows: [
+      { dir: 'sends', text: 'Real-time and historical market data' },
+      { dir: 'sends', text: 'Fundamental data (earnings, filings, financials)' },
+      { dir: 'receives', text: 'Subscription fees ($24K+/yr for Bloomberg Terminal)' },
+      { dir: 'receives', text: 'Raw data from exchanges (purchased feeds)' }
+    ]
+  },
+  'altdata': {
+    title: 'Alternative Data Providers',
+    flows: [
+      { dir: 'sends', text: 'Satellite imagery, credit card data, web scraping, NLP' },
+      { dir: 'sends', text: 'Signals that provide informational edge before public data' },
+      { dir: 'receives', text: 'Subscription fees from hedge funds and quant firms' },
+      { dir: 'receives', text: 'Market projected to exceed $130B by 2032' }
+    ]
+  },
+  'regulator': {
+    title: 'Regulators',
+    flows: [
+      { dir: 'sends', text: 'Best execution rules (Reg NMS Rule 611)' },
+      { dir: 'sends', text: 'Market access controls (Rule 15c3-5)' },
+      { dir: 'sends', text: 'Audit trail requirements and market surveillance' },
+      { dir: 'sends', text: 'Pattern Day Trader rules (FINRA — pending reform)' },
+      { dir: 'sends', text: 'ATS registration for dark pools' }
+    ]
+  },
+  'sip': {
+    title: 'SIP / Consolidated Tape',
+    flows: [
+      { dir: 'receives', text: 'Best bid/ask quotes from all lit exchanges' },
+      { dir: 'sends', text: 'NBBO (National Best Bid & Offer) to all participants' },
+      { dir: 'sends', text: 'Public market data (slower than direct exchange feeds)' },
+      { dir: 'receives', text: 'HFT firms pay for faster direct feeds to gain speed edge over SIP' }
+    ]
+  }
+};
+
+// Tooltip logic
+const tooltip = document.getElementById('tooltip');
+const nodes = document.querySelectorAll('.node');
+
+nodes.forEach(node => {
+  node.addEventListener('mouseenter', (e) => {
+    const key = node.id;
+    const data = tooltips[key];
+    if (!data) return;
+
+    let html = `<h4>${data.title}</h4>`;
+    data.flows.forEach(f => {
+      html += `<div class="flow-item">
+        <div class="flow-label ${f.dir}">${f.dir === 'sends' ? '→ SENDS' : '← RECEIVES'}</div>
+        <p>${f.text}</p>
+      </div>`;
+    });
+
+    tooltip.innerHTML = html;
+    tooltip.classList.add('visible');
+
+    // Position
+    const rect = node.getBoundingClientRect();
+    const container = document.getElementById('diagram').getBoundingClientRect();
+    let left = rect.right - container.left + 10;
+    let top = rect.top - container.top;
+
+    if (left + 320 > 1100) {
+      left = rect.left - container.left - 330;
+    }
+    if (top + 250 > 820) {
+      top = 820 - 280;
+    }
+
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  });
+
+  node.addEventListener('mouseleave', () => {
+    tooltip.classList.remove('visible');
+  });
+});
+</script>
+
+</body>
+</html>
