@@ -6,8 +6,8 @@
 //@version=5
 strategy("VWAP Mean Reversion", 
      overlay=true, 
-     initial_capital=100000, 
-     default_qty_type=strategy.percent_of_equity, 
+     initial_capital=10000, 
+     default_qty_type=strategy.fixed, 
      default_qty_value=1,
      commission_type=strategy.commission.cash_per_order, 
      commission_value=0.0,
@@ -48,6 +48,8 @@ maxDailyTrades  = input.int(4, "Max Trades Per Day", minval=1, maxval=20, group=
 
 // -- Risk Management --
 grp_risk = "Risk Management"
+riskPerTrade    = input.float(1.0, "Risk Per Trade (% of equity)", minval=0.1, maxval=5.0, step=0.1, group=grp_risk, tooltip="Max equity lost if stop is hit. 0.5–1% conservative, 2%+ aggressive.")
+maxCapPct       = input.float(25.0, "Max Capital Per Trade (%)", minval=1.0, maxval=25.0, step=1.0, group=grp_risk, tooltip="Hard cap on position size as % of equity, regardless of volatility calc.")
 stopATRMult     = input.float(0.3, "Stop Loss (ATR multiplier beyond band)", minval=0.05, maxval=2.0, step=0.05, group=grp_risk)
 tp1Pct          = input.float(50.0, "TP1 Close % (at inner band)", minval=10.0, maxval=90.0, step=5.0, group=grp_risk)
 atrLength       = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_risk)
@@ -203,6 +205,36 @@ longCondition  = confirmed and canTrade and regimeOK and volOK and lowerRejectio
 shortCondition = confirmed and canTrade and regimeOK and volOK and upperRejection and strategy.position_size == 0
 
 // ─────────────────────────────────────────────
+// 📐 VOLATILITY-BASED POSITION SIZING
+// ─────────────────────────────────────────────
+
+// Logic: Size the position so that if the stop loss is hit,
+// you lose exactly riskPerTrade% of equity. Then cap at maxCapPct%.
+//
+// Formula:
+//   riskDollars   = equity × (riskPerTrade / 100)
+//   stopDistance   = distance from entry to stop (in price)
+//   riskBasedQty   = riskDollars / stopDistance
+//   capBasedQty    = (equity × maxCapPct / 100) / entryPrice
+//   finalQty       = min(riskBasedQty, capBasedQty)
+
+equity = strategy.equity
+
+// Long sizing: stop is below the lower entry band
+longStopDist    = close - (lowerEntry - stopATRMult * atrVal)
+longRiskQty     = longStopDist > 0 ? (equity * riskPerTrade / 100.0) / longStopDist : 0
+longCapQty      = close > 0 ? (equity * maxCapPct / 100.0) / close : 0
+longQty         = math.floor(math.min(longRiskQty, longCapQty))
+longQty        := math.max(longQty, 1)  // minimum 1 share
+
+// Short sizing: stop is above the upper entry band
+shortStopDist   = (upperEntry + stopATRMult * atrVal) - close
+shortRiskQty    = shortStopDist > 0 ? (equity * riskPerTrade / 100.0) / shortStopDist : 0
+shortCapQty     = close > 0 ? (equity * maxCapPct / 100.0) / close : 0
+shortQty        = math.floor(math.min(shortRiskQty, shortCapQty))
+shortQty       := math.max(shortQty, 1)
+
+// ─────────────────────────────────────────────
 // 📍 STOP LOSS & TAKE PROFIT LEVELS
 // ─────────────────────────────────────────────
 
@@ -230,12 +262,12 @@ if shortCondition
 // ─────────────────────────────────────────────
 
 if longCondition
-    strategy.entry("Long", strategy.long)
+    strategy.entry("Long", strategy.long, qty=longQty)
     strategy.exit("Long TP1", from_entry="Long", qty_percent=tp1Pct, limit=longTP1, stop=longStop)
     strategy.exit("Long TP2", from_entry="Long", limit=longTP2, stop=longStop)
 
 if shortCondition
-    strategy.entry("Short", strategy.short)
+    strategy.entry("Short", strategy.short, qty=shortQty)
     strategy.exit("Short TP1", from_entry="Short", qty_percent=tp1Pct, limit=shortTP1, stop=shortStop)
     strategy.exit("Short TP2", from_entry="Short", limit=shortTP2, stop=shortStop)
 
@@ -259,22 +291,28 @@ if not inSession and strategy.position_size != 0
 
 // Alert conditions for TradersPost integration
 if enableAlerts and longCondition
-    alert('{"action":"buy","sentiment":"bullish","ticker":"{{ticker}}","price":{{close}}}', alert.freq_once_per_bar_close)
+    alert('{"action":"buy","sentiment":"bullish","ticker":"{{ticker}}","price":{{close}},"quantity":' + str.tostring(longQty) + '}', alert.freq_once_per_bar_close)
 
 if enableAlerts and shortCondition
-    alert('{"action":"sell","sentiment":"bearish","ticker":"{{ticker}}","price":{{close}}}', alert.freq_once_per_bar_close)
+    alert('{"action":"sell","sentiment":"bearish","ticker":"{{ticker}}","price":{{close}},"quantity":' + str.tostring(shortQty) + '}', alert.freq_once_per_bar_close)
 
 if enableAlerts and not inSession and strategy.position_size != 0
-    alert('{"action":"exit","sentiment":"flat","ticker":"{{ticker}}","price":{{close}}}', alert.freq_once_per_bar_close)
+    alert('{"action":"exit","sentiment":"flat","ticker":"{{ticker}}","price":{{close}},"quantity":' + str.tostring(math.abs(strategy.position_size)) + '}', alert.freq_once_per_bar_close)
 
 // ─────────────────────────────────────────────
 // 📊 DASHBOARD TABLE
 // ─────────────────────────────────────────────
 
-var table dash = table.new(position.top_right, 2, 8, 
+var table dash = table.new(position.top_right, 2, 10, 
      bgcolor=color.new(color.black, 80), 
      border_color=color.new(color.gray, 60), 
      border_width=1)
+
+// Current sizing for display
+dispQty     = close > upperInner ? shortQty : longQty
+dispStopDist = close > upperInner ? shortStopDist : longStopDist
+dispRiskAmt  = dispStopDist * dispQty
+dispCapPct   = equity > 0 ? (dispQty * close / equity) * 100 : 0.0
 
 if barstate.islast
     table.cell(dash, 0, 0, "Metric",       text_color=color.gray, text_size=size.small)
@@ -304,8 +342,16 @@ if barstate.islast
     table.cell(dash, 1, 6, str.tostring(dailyTradeCount) + " / " + str.tostring(maxDailyTrades), 
          text_color=canTrade ? color.green : color.orange, text_size=size.small)
     
-    table.cell(dash, 0, 7, "Position",      text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 7, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", 
+    table.cell(dash, 0, 7, "Next Qty",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(dispQty) + " shares", 
+         text_color=color.aqua, text_size=size.small)
+    
+    table.cell(dash, 0, 8, "Capital Used",  text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(dispCapPct, "#.#") + "%", 
+         text_color=dispCapPct <= maxCapPct ? color.green : color.red, text_size=size.small)
+    
+    table.cell(dash, 0, 9, "Position",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, strategy.position_size > 0 ? "LONG " + str.tostring(math.abs(strategy.position_size), "#") : strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size), "#") : "FLAT", 
          text_color=strategy.position_size != 0 ? color.yellow : color.gray, text_size=size.small)
 
 // ─────────────────────────────────────────────
