@@ -1,0 +1,454 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Leo — ETF Basis Spread Reversion Strategy v1.0
+// Pairs-style mean reversion on the SPY/QQQ ratio (or any two correlated ETFs)
+// Designed for intraday use with TradersPost dual-leg webhook integration
+
+//@version=5
+strategy("ETF Basis Spread",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_order,
+     commission_value=0.0,
+     slippage=1,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     max_bars_back=5000)
+
+// ─────────────────────────────────────────────
+// 📌 INPUTS
+// ─────────────────────────────────────────────
+
+// -- Pair Selection --
+grp_pair = "Pair Configuration"
+hedgeSymbol     = input.symbol("NASDAQ:QQQ", "Hedge Symbol (Leg B)", group=grp_pair, tooltip="The second leg of the pair. Chart symbol is Leg A.")
+useLogRatio     = input.bool(true, "Use Log Ratio", group=grp_pair, tooltip="Log(A/B) is more stationary than A/B for assets at different price levels.")
+
+// -- Spread Z-Score --
+grp_spread = "Spread / Z-Score"
+zLookback       = input.int(30, "Z-Score Lookback (bars)", minval=10, maxval=500, step=5, group=grp_spread, tooltip="Rolling window for mean and stdev of the spread. 30 bars on 5m = ~2.5 hours.")
+entryZ          = input.float(1.0, "Entry Z-Score Threshold", minval=0.3, maxval=5.0, step=0.1, group=grp_spread, tooltip="Enter when z-score exceeds this. 0.8–1.5 for leveraged ETF pairs, 1.5–2.5 for uncorrelated pairs.")
+exitZ           = input.float(0.25, "Exit Z-Score (mean reversion target)", minval=0.0, maxval=2.0, step=0.05, group=grp_spread, tooltip="Close when z-score reverts to this level. 0.0 = full reversion to mean.")
+maxZ            = input.float(3.0, "Max Z-Score (blowout filter)", minval=1.5, maxval=8.0, step=0.5, group=grp_spread, tooltip="Skip entries above this — spread may be breaking down, not reverting.")
+
+// -- Dynamic Hedge Ratio --
+grp_hedge = "Hedge Ratio"
+useRollingHedge = input.bool(true, "Use Rolling Hedge Ratio", group=grp_hedge, tooltip="Dynamically size Leg B relative to Leg A based on rolling beta.")
+hedgeLookback   = input.int(120, "Hedge Ratio Lookback (bars)", minval=20, maxval=500, step=10, group=grp_hedge, tooltip="Window for rolling beta calculation. Longer = more stable, shorter = more adaptive.")
+
+// -- Correlation Regime Filter --
+grp_corr = "Correlation Filter"
+useCorrFilter   = input.bool(true, "Enable Correlation Filter", group=grp_corr)
+corrLookback    = input.int(60, "Correlation Lookback (bars)", minval=10, maxval=500, step=5, group=grp_corr)
+corrThreshold   = input.float(0.80, "Min Correlation for Entry", minval=0.3, maxval=0.99, step=0.05, group=grp_corr, tooltip="Below this, the pair has decoupled. Mean reversion is unreliable.")
+
+// -- Volume Confirmation --
+grp_vol = "Volume Filter"
+useVolFilter    = input.bool(true, "Enable Volume Filter", group=grp_vol)
+volLookback     = input.int(10, "Volume SMA Lookback", minval=3, maxval=50, group=grp_vol)
+volThreshold    = input.float(1.0, "Volume Ratio Threshold", minval=0.3, maxval=2.0, step=0.1, group=grp_vol, tooltip="Entry only when volume < this × SMA. Filters momentum chasing.")
+
+// -- Risk Management --
+grp_risk = "Risk Management"
+riskPerTrade    = input.float(1.0, "Risk Per Trade (% of equity)", minval=0.1, maxval=5.0, step=0.1, group=grp_risk, tooltip="Max equity lost if stop is hit. 0.5–1% conservative, 2%+ aggressive.")
+maxCapPct       = input.float(25.0, "Max Capital Per Trade (%)", minval=1.0, maxval=100.0, step=1.0, group=grp_risk, tooltip="Hard cap on position size as % of equity.")
+stopZMult       = input.float(1.0, "Stop Z-Score (beyond entry)", minval=0.25, maxval=3.0, step=0.25, group=grp_risk, tooltip="Stop triggers at entryZ + this value. E.g., entry at 2.0 + stop 1.0 = stop at z=3.0")
+atrLength       = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_risk)
+maxDailyTrades  = input.int(4, "Max Trades Per Day", minval=1, maxval=20, group=grp_risk)
+
+// -- Session Filter --
+grp_session = "Session"
+sessionStart    = input.session("0930-1545", "Trading Session", group=grp_session, tooltip="Eastern Time. Avoids first/last 15 min.")
+
+// -- TradersPost --
+grp_tp = "TradersPost Webhooks"
+enableAlerts    = input.bool(true, "Enable TradersPost Alerts", group=grp_tp)
+
+// ─────────────────────────────────────────────
+// 🔧 HELPER: STRIP EXCHANGE PREFIX FROM SYMBOL
+// ─────────────────────────────────────────────
+
+// TradingView symbols come as "EXCHANGE:TICKER" (e.g., "NASDAQ:QQQ", "BATS:QQQ").
+// TradersPost expects just the ticker. Strip everything up to and including ":".
+hedgeTicker(sym) =>
+    colonPos = str.pos(sym, ":")
+    colonPos >= 0 ? str.substring(sym, colonPos + 1) : sym
+
+hedgeTickerClean = hedgeTicker(hedgeSymbol)
+
+// ─────────────────────────────────────────────
+// 📡 FETCH HEDGE SYMBOL DATA
+// ─────────────────────────────────────────────
+
+// Pull close and volume from the hedge symbol on the same timeframe.
+// barmerge.gaps_off fills gaps; lookahead off prevents future leak.
+hedgeClose = request.security(hedgeSymbol, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+hedgeVol   = request.security(hedgeSymbol, timeframe.period, volume, barmerge.gaps_off, barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────
+// 📐 SPREAD CALCULATION
+// ─────────────────────────────────────────────
+
+// Ratio: SymA / SymB  (or log of that)
+// When the ratio is HIGH → SymA is relatively expensive → short A, long B
+// When the ratio is LOW  → SymA is relatively cheap    → long A, short B
+
+rawRatio  = hedgeClose != 0 ? close / hedgeClose : na
+spreadVal = useLogRatio ? math.log(rawRatio) : rawRatio
+
+// Rolling mean and stdev of the spread
+spreadMean  = ta.sma(spreadVal, zLookback)
+spreadStdev = ta.stdev(spreadVal, zLookback)
+
+// Z-Score: how many standard deviations from the rolling mean
+zScore = spreadStdev != 0 ? (spreadVal - spreadMean) / spreadStdev : 0.0
+
+// ─────────────────────────────────────────────
+// 📊 DYNAMIC HEDGE RATIO (ROLLING BETA)
+// ─────────────────────────────────────────────
+
+// Beta = correlation(A, B) × stdev(A) / stdev(B)
+// This tells us: for every 1 share of A, how many shares of B to hedge with.
+// On a dollar-neutral basis: hedgeQty = chartQty × (priceA / priceB) × beta
+
+retA = close / close[1] - 1
+retB = hedgeClose / hedgeClose[1] - 1
+
+rollingCorr  = ta.correlation(retA, retB, corrLookback)
+rollingStdA  = ta.stdev(retA, hedgeLookback)
+rollingStdB  = ta.stdev(retB, hedgeLookback)
+
+// Beta via correlation method
+rollingBeta = rollingStdB != 0 ? rollingCorr * (rollingStdA / rollingStdB) : 1.0
+
+// Hedge ratio for position sizing: how many shares of B per share of A
+// If beta=1.2 and price ratio is 4:1, then for 10 shares of SPY you'd need
+// 10 × (SPY_price / QQQ_price) × 1.2 shares of QQQ for dollar-neutrality
+hedgeRatio = useRollingHedge ? math.abs(rollingBeta) : 1.0
+
+// ─────────────────────────────────────────────
+// 🔗 CORRELATION REGIME FILTER
+// ─────────────────────────────────────────────
+
+// When correlation breaks down, the spread loses its mean-reverting property.
+// We only trade when the pair is tightly correlated.
+corrOK = useCorrFilter ? (not na(rollingCorr) and rollingCorr >= corrThreshold) : true
+
+// ─────────────────────────────────────────────
+// 🔊 VOLUME FILTER
+// ─────────────────────────────────────────────
+
+volSMA   = ta.sma(volume, volLookback)
+volRatio = volSMA != 0 ? volume / volSMA : 1.0
+volOK    = useVolFilter ? volRatio < volThreshold : true
+
+// ─────────────────────────────────────────────
+// ⏰ SESSION & DAILY TRADE COUNTER
+// ─────────────────────────────────────────────
+
+isNewDay  = ta.change(time("D")) != 0
+inSession = not na(time(timeframe.period, sessionStart))
+
+var int dailyTradeCount = 0
+if isNewDay
+    dailyTradeCount := 0
+
+canTrade = inSession and dailyTradeCount < maxDailyTrades
+
+// ─────────────────────────────────────────────
+// 🎯 ENTRY CONDITIONS
+// ─────────────────────────────────────────────
+
+confirmed = barstate.isconfirmed
+
+// Z-score must be beyond entry threshold but not in blowout territory
+zLongSpread  = zScore <= -entryZ and zScore >= -maxZ   // spread is low → A is cheap → long A, short B
+zShortSpread = zScore >= entryZ  and zScore <= maxZ    // spread is high → A is rich → short A, long B
+
+// All filters must pass
+longCondition  = confirmed and canTrade and corrOK and volOK and zLongSpread and strategy.position_size == 0
+shortCondition = confirmed and canTrade and corrOK and volOK and zShortSpread and strategy.position_size == 0
+
+// ─────────────────────────────────────────────
+// 📐 VOLATILITY-BASED POSITION SIZING
+// ─────────────────────────────────────────────
+
+// Stop distance is derived from the z-score stop mapped to price space.
+// Approximate: stop_price_distance ≈ stopZMult × spreadStdev × close
+// (since z-score = spread/stdev, a 1σ move ≈ stdev × price for log ratio)
+
+atrVal = ta.atr(atrLength)
+equity = strategy.equity
+
+// Price-space stop distance approximation
+// For log ratio: d(log(P)) ≈ dP/P, so dP ≈ P × d(log-spread)
+// For raw ratio: less precise but still functional
+stopSpreadDist = stopZMult * (spreadStdev != 0 ? spreadStdev : 0.001)
+stopPriceDist  = useLogRatio ? close * stopSpreadDist : close * stopSpreadDist / (rawRatio != 0 ? rawRatio : 1.0)
+// Floor the stop at 0.5 ATR to avoid absurdly tight stops
+stopPriceDist := math.max(stopPriceDist, 0.5 * atrVal)
+
+riskDollars = equity * riskPerTrade / 100.0
+riskQty     = stopPriceDist > 0 ? riskDollars / stopPriceDist : 0
+capQty      = close > 0 ? (equity * maxCapPct / 100.0) / close : 0
+chartQty    = math.floor(math.min(riskQty, capQty))
+chartQty   := math.max(chartQty, 1)
+
+// Hedge leg quantity: dollar-neutral sizing
+hedgeQtyRaw = hedgeClose > 0 ? chartQty * (close / hedgeClose) * hedgeRatio : 0
+hedgeQty    = math.max(math.round(hedgeQtyRaw), 1)
+
+// ─────────────────────────────────────────────
+// 📍 STOP & EXIT LEVELS
+// ─────────────────────────────────────────────
+
+// Stops are z-score based, but we need price-level stops for strategy.exit.
+// We compute the price where the z-score would hit our stop level.
+
+var float entryPrice   = na
+var float stopPrice    = na
+var float entryZScore  = na
+
+if longCondition
+    entryPrice   := close
+    entryZScore  := zScore
+    // Stop: price drops further (z goes more negative)
+    stopPrice    := close - stopPriceDist
+    dailyTradeCount += 1
+
+if shortCondition
+    entryPrice   := close
+    entryZScore  := zScore
+    // Stop: price rises further (z goes more positive)
+    stopPrice    := close + stopPriceDist
+    dailyTradeCount += 1
+
+// ─────────────────────────────────────────────
+// 🚀 EXECUTE TRADES
+// ─────────────────────────────────────────────
+
+if longCondition
+    strategy.entry("Long", strategy.long, qty=chartQty)
+    strategy.exit("Long Stop", from_entry="Long", stop=stopPrice)
+
+if shortCondition
+    strategy.entry("Short", strategy.short, qty=chartQty)
+    strategy.exit("Short Stop", from_entry="Short", stop=stopPrice)
+
+// ─────────────────────────────────────────────
+// 🎯 Z-SCORE MEAN REVERSION EXIT
+// ─────────────────────────────────────────────
+
+// Close when z-score reverts to the exit threshold
+// This is a market exit (not a limit), checked each bar
+
+longMeanReverted  = strategy.position_size > 0 and zScore >= -exitZ
+shortMeanReverted = strategy.position_size < 0 and zScore <= exitZ
+
+if longMeanReverted
+    strategy.close("Long", comment="Z Revert")
+
+if shortMeanReverted
+    strategy.close("Short", comment="Z Revert")
+
+// ─────────────────────────────────────────────
+// 🔔 END-OF-DAY FLATTEN
+// ─────────────────────────────────────────────
+
+var bool eodAlertSent = false
+if isNewDay
+    eodAlertSent := false
+
+if not inSession and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flatten")
+
+// ─────────────────────────────────────────────
+// 🔔 TRADERSPOST WEBHOOK ALERTS
+// ─────────────────────────────────────────────
+
+// Each signal fires TWO alerts: one for the chart leg, one for the hedge leg.
+// TradersPost setup: create two separate webhooks (one per broker/account)
+// or use a single webhook with a router that parses the "leg" field.
+
+// Build ticker string once (strip exchange prefix from chart symbol too)
+chartTicker = str.pos(syminfo.tickerid, ":") >= 0 ? str.substring(syminfo.tickerid, str.pos(syminfo.tickerid, ":") + 1) : syminfo.ticker
+priceStr    = str.tostring(close, "#.##")
+hedgePrStr  = str.tostring(hedgeClose, "#.##")
+
+if enableAlerts and longCondition
+    // Leg A: buy the chart symbol (spread is low, A is cheap)
+    alert('{"action":"buy","sentiment":"bullish","ticker":"' + chartTicker + '","price":' + priceStr + ',"quantity":' + str.tostring(chartQty) + ',"leg":"A","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+    // Leg B: sell the hedge symbol
+    alert('{"action":"sell","sentiment":"bearish","ticker":"' + hedgeTickerClean + '","price":' + hedgePrStr + ',"quantity":' + str.tostring(hedgeQty) + ',"leg":"B","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+
+if enableAlerts and shortCondition
+    // Leg A: sell the chart symbol (spread is high, A is rich)
+    alert('{"action":"sell","sentiment":"bearish","ticker":"' + chartTicker + '","price":' + priceStr + ',"quantity":' + str.tostring(chartQty) + ',"leg":"A","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+    // Leg B: buy the hedge symbol
+    alert('{"action":"buy","sentiment":"bullish","ticker":"' + hedgeTickerClean + '","price":' + hedgePrStr + ',"quantity":' + str.tostring(hedgeQty) + ',"leg":"B","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+
+if enableAlerts and longMeanReverted
+    alert('{"action":"exit","ticker":"' + chartTicker + '","price":' + priceStr + ',"quantity":' + str.tostring(math.abs(strategy.position_size)) + ',"leg":"A","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+    alert('{"action":"exit","ticker":"' + hedgeTickerClean + '","price":' + hedgePrStr + ',"quantity":' + str.tostring(hedgeQty) + ',"leg":"B","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+
+if enableAlerts and shortMeanReverted
+    alert('{"action":"exit","ticker":"' + chartTicker + '","price":' + priceStr + ',"quantity":' + str.tostring(math.abs(strategy.position_size)) + ',"leg":"A","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+    alert('{"action":"exit","ticker":"' + hedgeTickerClean + '","price":' + hedgePrStr + ',"quantity":' + str.tostring(hedgeQty) + ',"leg":"B","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+
+if enableAlerts and not inSession and strategy.position_size != 0 and not eodAlertSent
+    alert('{"action":"exit","ticker":"' + chartTicker + '","price":' + priceStr + ',"quantity":' + str.tostring(math.abs(strategy.position_size)) + ',"leg":"A","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+    alert('{"action":"exit","ticker":"' + hedgeTickerClean + '","price":' + hedgePrStr + ',"quantity":' + str.tostring(hedgeQty) + ',"leg":"B","strategy":"etf_basis"}', alert.freq_once_per_bar_close)
+    eodAlertSent := true
+
+// ─────────────────────────────────────────────å
+// 📊 SPREAD VISUALIZATION (lower pane recommended)
+// ─────────────────────────────────────────────
+
+// Z-Score in status line for live monitoring
+plot(zScore, "Z-Score", color=color.white, display=display.status_line)
+plot(entryZ, "+Entry Z", color=color.red, display=display.status_line)
+plot(-entryZ, "-Entry Z", color=color.green, display=display.status_line)
+
+// Entry markers on the price chart
+plotshape(longCondition,  title="Long Spread",  location=location.belowbar, style=shape.triangleup,   color=color.lime, size=size.small, text="LS")
+plotshape(shortCondition, title="Short Spread", location=location.abovebar, style=shape.triangledown, color=color.fuchsia, size=size.small, text="SS")
+
+// Mean reversion exit markers
+plotshape(longMeanReverted,  title="Long Exit",  location=location.abovebar, style=shape.xcross, color=color.lime,    size=size.tiny, text="X")
+plotshape(shortMeanReverted, title="Short Exit", location=location.belowbar, style=shape.xcross, color=color.fuchsia, size=size.tiny, text="X")
+
+// ─────────────────────────────────────────────
+// ⚠️ CHART CONFIGURATION WARNING
+// ─────────────────────────────────────────────
+
+// Detect if chart symbol or timeframe doesn't match recommended setup.
+// Pine can't change these — this just warns the user visually.
+recSymbol   = "SPY"
+recTFMin    = 5
+chartTFMin  = timeframe.in_seconds(timeframe.period) / 60
+wrongSymbol = not str.contains(syminfo.ticker, recSymbol)
+wrongTF     = chartTFMin != recTFMin
+
+var table warnBox = table.new(position.bottom_center, 1, 1,
+     bgcolor=color.new(color.red, 20),
+     border_color=color.red,
+     border_width=2)
+
+if barstate.islast and (wrongSymbol or wrongTF)
+    warnMsg = "⚠ RECOMMENDED: " + recSymbol + " on " + str.tostring(recTFMin) + "m chart"
+    warnMsg += wrongSymbol ? "  |  Current symbol: " + syminfo.ticker : ""
+    warnMsg += wrongTF ? "  |  Current TF: " + str.tostring(chartTFMin) + "m" : ""
+    table.cell(warnBox, 0, 0, warnMsg, text_color=color.white, text_size=size.normal)
+
+if barstate.islast and not wrongSymbol and not wrongTF
+    table.cell(warnBox, 0, 0, "", bgcolor=color.new(color.black, 100))
+
+// ─────────────────────────────────────────────
+// 📊 DASHBOARD TABLE
+// ─────────────────────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 12,
+     bgcolor=color.new(color.black, 80),
+     border_color=color.new(color.gray, 60),
+     border_width=1)
+
+dispCapPct = equity > 0 ? (chartQty * close / equity) * 100 : 0.0
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Metric",         text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 0, "Value",           text_color=color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 1, "Spread Ratio",   text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(rawRatio, "#.####"),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Z-Score",        text_color=color.white, text_size=size.small)
+    zColor = math.abs(zScore) >= entryZ ? color.yellow : math.abs(zScore) >= entryZ * 0.75 ? color.orange : color.green
+    table.cell(dash, 1, 2, str.tostring(zScore, "#.##"),
+         text_color=zColor, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Correlation",    text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(rollingCorr, "#.###"),
+         text_color=corrOK ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Hedge Ratio",    text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(hedgeRatio, "#.###"),
+         text_color=color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Beta",           text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(rollingBeta, "#.###"),
+         text_color=color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 6, "Vol Ratio",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, str.tostring(volRatio, "#.##"),
+         text_color=volOK ? color.green : color.orange, text_size=size.small)
+
+    table.cell(dash, 0, 7, "Session",        text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, inSession ? "ACTIVE" : "CLOSED",
+         text_color=inSession ? color.green : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 8, "Trades Today",   text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(dailyTradeCount) + " / " + str.tostring(maxDailyTrades),
+         text_color=canTrade ? color.green : color.orange, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Chart Qty",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, str.tostring(chartQty) + " shares",
+         text_color=color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 10, "Hedge Qty",     text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 10, str.tostring(hedgeQty) + " shares",
+         text_color=color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 11, "Position",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 11, strategy.position_size > 0 ? "LONG " + str.tostring(math.abs(strategy.position_size), "#") : strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size), "#") : "FLAT",
+         text_color=strategy.position_size != 0 ? color.yellow : color.gray, text_size=size.small)
+
+// ─────────────────────────────────────────────
+// 🛈 USAGE NOTES
+// ─────────────────────────────────────────────
+//
+// HOW IT WORKS:
+//   This strategy monitors the price ratio between two correlated ETFs
+//   (default: SPY / QQQ). When the ratio deviates significantly from its
+//   rolling mean (measured by z-score), it bets on mean reversion:
+//     - Z too low  → Leg A is cheap → Long A, Short B
+//     - Z too high → Leg A is rich  → Short A, Long B
+//
+// RECOMMENDED PAIRS:
+//   SPY / QQQ  → Large-cap tech vs broad market (default)
+//   SPY / IWM  → Large-cap vs small-cap rotation
+//   GLD / GDX  → Gold vs gold miners
+//   XLF / XLK  → Financials vs tech sector
+//   QQQ / SMH  → Broad tech vs semiconductors
+//
+// TRADERSPOST SETUP (DUAL-LEG):
+//   Option A — Two webhooks:
+//     1. Create alert on this strategy
+//     2. In TradersPost, set up two webhooks (one per account/leg)
+//     3. Use "leg" field in JSON to route: "A" = chart symbol, "B" = hedge
+//
+//   Option B — Single webhook with router:
+//     1. Single TradersPost webhook receives both alerts
+//     2. Parse "leg" + "ticker" fields to route to correct account
+//     3. "strategy":"etf_basis" field distinguishes from other strategies
+//
+// BACKTEST NOTES:
+//   - Backtest only reflects Leg A (chart symbol) P&L
+//   - True pair P&L = Leg A + Leg B (must track externally)
+//   - Run on 5m SPY chart with QQQ as hedge for initial validation
+//   - Z-Score lookback of 60 on 5m ≈ 5-hour rolling window
+//
+// TUNING GUIDE:
+//   More trades:  Lower entryZ (1.5), shorter zLookback (30)
+//   Fewer trades: Higher entryZ (2.5), longer zLookback (120)
+//   Tighter risk: Lower stopZMult (0.5), higher corrThreshold (0.90)
+//   Wider stops:  Higher stopZMult (1.5), lower corrThreshold (0.70)
+//
+// KNOWN LIMITATIONS:
+//   - Pine Script can only execute strategy orders on the chart symbol
+//   - Hedge leg (Leg B) is managed via alerts to TradersPost only
+//   - request.security() data arrives at bar close — no tick-level sync
+//   - Backtest P&L is single-leg only; true pair P&L needs external calc
+//   - Max 40 request.security() calls per script (this uses 2)
